@@ -1,5 +1,8 @@
+// knowledge_base.rs
+
 use actix_web::{web, HttpResponse, Responder};
 use chrono::Utc;
+use futures_util::StreamExt; // Needed for stream extensions such as filter_map and collect.
 use mongodb::bson::{doc, Uuid};
 use serde::{Deserialize, Serialize};
 use crate::AppState;
@@ -18,7 +21,7 @@ pub struct Document {
 pub async fn create_document(data: web::Data<AppState>, req: web::Json<Document>) -> impl Responder {
     let collection = data.mongodb.db.collection::<Document>("knowledge_base");
     let new_doc = Document {
-        id: Uuid::new_v4(),
+        id: Uuid::new(), // Changed from Uuid::new_v4() to Uuid::new()
         team_id: req.team_id.clone(),
         title: req.title.clone(),
         content: req.content.clone(),
@@ -37,6 +40,10 @@ pub async fn get_team_documents(data: web::Data<AppState>, team_id: web::Path<St
     let collection = data.mongodb.db.collection::<Document>("knowledge_base");
     let cursor = collection.find(doc! { "team_id": team_id.as_str() }).await.unwrap();
 
-    let docs: Vec<Document> = cursor.filter_map(|doc| doc.ok()).collect().await;
+    // Use an async block in filter_map so that the closure returns a Future.
+    let docs: Vec<Document> = cursor
+        .filter_map(|doc| async move { doc.ok() })
+        .collect()
+        .await;
     HttpResponse::Ok().json(docs)
 }

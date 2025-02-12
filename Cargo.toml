@@ -14,9 +14,10 @@ bcrypt = "0.15"
 serde_json = "1.0"
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-mongodb = { version = "3", default-features = false, features = ["async-std-runtime", "rustls-tls", "compat-3-0-0"] }
+mongodb = { version = "3", default-features = false, features = ["rustls-tls", "compat-3-0-0"] }
 futures-util = "0.3.30"
 log = "0.4.22"
 env_logger = "0.11.5"
 jsonwebtoken = "8"
 dotenv = "0.15.0"
+futures = "0.3.31"

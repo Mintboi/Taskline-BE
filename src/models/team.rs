@@ -2,10 +2,10 @@ use actix_web::{web, HttpResponse, Responder};
 use uuid::Uuid;
 use chrono::Utc;
 use futures_util::StreamExt;
-use mongodb::bson::{doc, Bson};
+use mongodb::bson::{doc, Bson, DateTime as BsonDateTime};
 use mongodb::options::FindOptions;
 
-use crate::AppState;
+use crate::app_state::AppState;
 use crate::models::task::{Task, CreateTaskRequest, UpdateTaskRequest};
 
 pub async fn create_task(data: web::Data<AppState>, req: web::Json<CreateTaskRequest>) -> impl Responder {
@@ -15,7 +15,7 @@ pub async fn create_task(data: web::Data<AppState>, req: web::Json<CreateTaskReq
         team_id: req.team_id.clone(),
         title: req.title.clone(),
         description: req.description.clone(),
-        priority: 0, // default, AI can update later
+        priority: 0,
         assignee_id: None,
         status: "todo".to_string(),
         created_at: Utc::now(),
@@ -32,7 +32,7 @@ pub async fn create_task(data: web::Data<AppState>, req: web::Json<CreateTaskReq
 pub async fn get_tasks_by_team(data: web::Data<AppState>, team_id: web::Path<String>) -> impl Responder {
     let tasks_coll = data.mongodb.db.collection::<Task>("tasks");
     let filter = doc! { "team_id": &*team_id };
-    let mut cursor = match tasks_coll.find(filter, FindOptions::default()).await {
+    let mut cursor = match tasks_coll.find(filter).await {
         Ok(cursor) => cursor,
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error fetching tasks: {:?}", e)),
     };
@@ -76,9 +76,9 @@ pub async fn update_task(
         return HttpResponse::BadRequest().body("No fields to update");
     }
 
-    update_doc.insert("updated_at", Utc::now());
+    update_doc.insert("updated_at", BsonDateTime::from_millis(Utc::now().timestamp_millis()));
 
-    match tasks_coll.update_one(doc! {"_id": task_id_bson}, doc!{"$set": update_doc}, None).await {
+    match tasks_coll.update_one(doc! {"_id": task_id_bson}, doc!{"$set": update_doc}).await {
         Ok(res) => {
             if res.matched_count == 0 {
                 HttpResponse::NotFound().body("Task not found")
@@ -90,20 +90,10 @@ pub async fn update_task(
     }
 }
 
-pub async fn delete_task(    data: web::Data<AppState>,
-    path: web::Path<Uuid>,
-) -> impl Responder {
-    let tasks_coll = data.mongodb.db.collection::<Task>("tasks");
-    let task_id_bson = Bson::String(path.to_string());
-
-    match tasks_coll.delete_one(doc! {"_id": task_id_bson}, None).await {
-        Ok(res) => {
-            if res.deleted_count == 0 {
-                HttpResponse::NotFound().body("Task not found")
-            } else {
-                HttpResponse::Ok().body("Task deleted")
-            }
-        }
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error deleting task: {:?}", e))
+pub async fn delete_task(data: web::Data<AppState>, task_id: web::Path<Uuid>) -> impl Responder {
+    let tasks_collection = data.mongodb.db.collection::<Uuid>("tasks");
+    match tasks_collection.delete_one(doc! { "_id": task_id.to_string() }).await {
+        Ok(_) => HttpResponse::Ok().body("Task deleted"),
+        Err(_) => HttpResponse::InternalServerError().body("Failed to delete task"),
     }
 }
