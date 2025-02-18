@@ -1,3 +1,5 @@
+// src/main.rs
+
 mod auth;
 mod team_management;
 mod app_state;
@@ -9,7 +11,9 @@ mod web_socket_server;
 mod project;
 mod chat;
 mod knowledge_base;
-mod user_management; // Newly added module for user endpoints
+mod user_management;
+// NEW (ensure this is present if you haven't already):
+mod board;
 
 use std::env;
 use std::sync::Arc;
@@ -29,21 +33,29 @@ use actix_web::{
 use env_logger::Env;
 use futures::future::{ok, Ready};
 use jsonwebtoken::{decode, DecodingKey, Validation};
+use mongodb::bson::doc;
 
-use crate::auth::{login, signup, Claims}; // We import Claims to decode the token properly
+use crate::auth::{login, signup, Claims};
 use crate::team_management::{
     create_team, get_team_members, get_user_teams, invite_user,
     get_team, update_team, delete_team, remove_team_member,
-    accept_invitation, decline_invitation, delete_invitations,
+    accept_invitation, decline_invitation, delete_invitations, get_pending_invitations,
 };
 use crate::project::{
     create_project, list_projects, get_project, update_project, delete_project,
 };
 use crate::app_state::AppState;
+use crate::chat::{
+    get_user_chats, create_chat, search_chats, delete_chat, create_message,
+    get_messages
+};
+use crate::user_management::{find_user_email, get_user_by_id};
+use crate::web_socket_server::ws_index;
+// NEW: the board handlers
+use crate::board::{
+    list_boards, create_board, update_board, delete_board,
+};
 
-/// ---------------------------
-/// 1) Define the Middleware
-/// ---------------------------
 #[derive(Debug)]
 pub struct Authentication;
 
@@ -83,14 +95,14 @@ where
     }
 
     fn call(&self, mut req: ServiceRequest) -> Self::Future {
-        // Check for Authorization header
+        // Extract "Bearer <token>" from the Authorization header if present
         if let Some(auth_header) = req.headers().get(http::header::AUTHORIZATION) {
             if let Ok(auth_str) = auth_header.to_str() {
                 if auth_str.starts_with("Bearer ") {
                     let token = auth_str.trim_start_matches("Bearer ").trim().to_string();
                     match verify_token(&token) {
                         Ok(user_id) => {
-                            // Insert the user_id from JWT into request extensions
+                            // Insert user_id as a string extension
                             req.extensions_mut().insert(user_id);
                         }
                         Err(e) => {
@@ -114,11 +126,8 @@ where
     }
 }
 
-/// Verify a JWT using the same secret that was used to create it.
-/// This version decodes the JWT's `Claims` struct and returns `sub` (user_id) on success.
 fn verify_token(token: &str) -> Result<String, String> {
-    // In practice, you might pull from your AppState config instead of env:
-    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "secret".to_string());
+    let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "secret".to_string());
     match decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_ref()),
@@ -129,9 +138,6 @@ fn verify_token(token: &str) -> Result<String, String> {
     }
 }
 
-/// ---------------------------
-/// 2) The main() function
-/// ---------------------------
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv::dotenv().ok();
@@ -139,7 +145,9 @@ async fn main() -> std::io::Result<()> {
 
     let config = config::Config::from_env();
     let mongodb = Arc::new(chat_db::MongoDB::init(&config.mongo_uri, &config.database_name).await);
+    // Start the ChatServer actor, which uses string-based IDs
     let chat_server = chat_server::ChatServer::new(mongodb.clone()).start();
+
     let frontend_origin = env::var("FRONTEND_ORIGIN")
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
 
@@ -159,23 +167,28 @@ async fn main() -> std::io::Result<()> {
             .max_age(3600);
 
         App::new()
+            // Logging middleware
             .wrap(Logger::default())
+            // CORS
             .wrap(cors)
+            // Our custom authentication
             .wrap(Authentication)
+            // Global state: pass the references to the chat_server actor and DB
             .app_data(web::Data::new(AppState {
                 chat_server: chat_server.clone(),
                 mongodb: mongodb.clone(),
                 config: config.clone(),
             }))
-            // Auth endpoints.
             .service(
                 web::scope("/auth")
                     .route("/signup", web::post().to(signup))
                     .route("/login", web::post().to(login))
             )
-            // Team endpoints.
+            // TEAMS
             .service(
                 web::scope("/teams")
+                    .route("/user_teams/{user_id}", web::get().to(get_user_teams))
+                    .route("/user_invitations/{user_id}", web::get().to(get_pending_invitations))
                     .route("", web::post().to(create_team))
                     .service(
                         web::scope("/{team_id}")
@@ -201,14 +214,40 @@ async fn main() -> std::io::Result<()> {
                                     .route("/{project_id}", web::get().to(get_project))
                                     .route("/{project_id}", web::put().to(update_project))
                                     .route("/{project_id}", web::delete().to(delete_project))
+                                    // NEW: Board routes nested under "projects"
+                                    .service(
+                                        web::scope("/{project_id}/boards")
+                                            .route("", web::get().to(list_boards))
+                                            .route("", web::post().to(create_board))
+                                            .route("/{board_id}", web::put().to(update_board))
+                                            .route("/{board_id}", web::delete().to(delete_board))
+                                    )
                             )
                     )
-                    .route("/user_teams/{user_id}", web::get().to(get_user_teams))
             )
-            // New Users endpoint for searching by email.
+            // CHATS
+            .service(
+                web::scope("/chats")
+                    .route("/{user_id}", web::get().to(get_user_chats))
+                    .route("", web::post().to(create_chat))
+                    .route("/search/{user_id}", web::get().to(search_chats))
+                    .route("/{chat_id}", web::delete().to(delete_chat))
+            )
+            // MESSAGES (GET and POST)
+            .service(
+                web::scope("/messages")
+                    .route("/{chat_id}", web::get().to(get_messages))
+                    .route("/{chat_id}", web::post().to(create_message))
+            )
+            // USERS
             .service(
                 web::scope("/users")
-                    .route("/find_user_email", web::get().to(user_management::find_user_email))
+                    .route("/find_user_email", web::get().to(find_user_email))
+                    .route("/get/{id}", web::get().to(get_user_by_id))
+            )
+            // WEBSOCKET route for real-time
+            .service(
+                web::resource("/ws").route(web::get().to(ws_index))
             )
     })
         .bind("0.0.0.0:8080")?

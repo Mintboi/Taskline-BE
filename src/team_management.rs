@@ -1,3 +1,4 @@
+// File: team-management.rs
 use actix_web::{web, HttpResponse, Responder, HttpRequest, HttpMessage};
 use futures_util::StreamExt;
 use mongodb::bson::{doc, to_document, DateTime as BsonDateTime, oid::ObjectId};
@@ -20,7 +21,8 @@ pub struct Team {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserTeam {
-    pub user_id: String, // stored in user_teams as the hex string of `_id`
+    // stored in user_teams as the hex string of `_id`
+    pub user_id: String,
     pub team_id: String,
     pub role: String,   // "admin" or "member"
     pub joined_at: chrono::DateTime<Utc>,
@@ -30,7 +32,9 @@ pub struct UserTeam {
 pub struct TeamInvitation {
     pub invitation_id: String,
     pub team_id: String,
-    pub invitee_id: String,   // stored as hex string or textual (username/email) if no user yet
+    // invitee_id is stored as a hex string if the user exists,
+    // otherwise it might be left as the raw text (email/username) if no user was found.
+    pub invitee_id: String,
     pub inviter_id: String,
     pub status: String,       // "pending", "accepted", or "declined"
     pub sent_at: chrono::DateTime<Utc>,
@@ -54,6 +58,15 @@ pub struct TeamMemberInfo {
     pub username: Option<String>,
     pub status: String,
     pub invitation_id: Option<String>,
+}
+
+/// Display object for invitations.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InvitationDisplay {
+    pub invitation_id: String,
+    pub team_id: String,
+    pub team_name: String,
+    pub inviter_username: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +101,82 @@ pub struct RemoveTeamMemberRequest {
 pub struct DeleteInvitationsRequest {
     pub team_id: String,
     pub invitation_ids: Vec<String>,
+}
+
+/// Retrieve pending invitations for a given user.
+/// The endpoint verifies that the JWT user matches the requested user.
+/// It then filters for invitations where invitee_id equals the user’s hex string.
+pub async fn get_pending_invitations(
+    req: HttpRequest,
+    data: web::Data<AppState>,
+    user_id: web::Path<String>,
+) -> impl Responder {
+    let current_user = if let Some(id) = req.extensions().get::<String>() {
+        id.trim().to_string()
+    } else {
+        error!("No user found in request extensions for get_pending_invitations");
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    };
+
+    let requested_user = user_id.trim().to_string();
+    debug!("Token user id: '{}' | Requested user id: '{}'", current_user, requested_user);
+
+    if current_user != requested_user {
+        error!("User mismatch: token user id '{}' does not match requested user id '{}'", current_user, requested_user);
+        return HttpResponse::Unauthorized().body("Cannot access other user's invitations");
+    }
+
+    let invitations_collection = data.mongodb.db.collection::<TeamInvitation>("team_invitations");
+    let filter = doc! { "invitee_id": &requested_user, "status": "pending" };
+
+    let mut cursor = match invitations_collection.find(filter).await {
+        Ok(cursor) => cursor,
+        Err(err) => {
+            error!("Error fetching invitations: {}", err);
+            return HttpResponse::InternalServerError().body(format!("Error fetching invitations: {}", err));
+        }
+    };
+
+    let mut displays: Vec<InvitationDisplay> = Vec::new();
+    let teams_collection = data.mongodb.db.collection::<Team>("teams");
+    let users_collection = data.mongodb.db.collection::<User>("users");
+
+    while let Some(inv_result) = cursor.next().await {
+        match inv_result {
+            Ok(inv) => {
+                // Look up team info.
+                let team_filter = doc! { "team_id": &inv.team_id };
+                let team_doc = teams_collection.find_one(team_filter).await.ok().flatten();
+                let team_name = team_doc.map(|t| t.name).unwrap_or_else(|| "Unknown Team".into());
+
+                // Look up inviter info.
+                let inviter_obj_id = ObjectId::parse_str(&inv.inviter_id).ok();
+                let inviter_username = if let Some(oid) = inviter_obj_id {
+                    let inviter_filter = doc! { "_id": oid };
+                    if let Ok(Some(inviter)) = users_collection.find_one(inviter_filter).await {
+                        inviter.username.unwrap_or_else(|| "Unknown Inviter".into())
+                    } else {
+                        "Unknown Inviter".into()
+                    }
+                } else {
+                    "Unknown Inviter".into()
+                };
+
+                displays.push(InvitationDisplay {
+                    invitation_id: inv.invitation_id,
+                    team_id: inv.team_id,
+                    team_name,
+                    inviter_username,
+                });
+            },
+            Err(err) => {
+                error!("Error iterating invitations: {}", err);
+                return HttpResponse::InternalServerError().body(format!("Error iterating invitations: {}", err));
+            }
+        }
+    }
+
+    HttpResponse::Ok().json(displays)
 }
 
 pub async fn get_user_teams(
@@ -216,7 +305,7 @@ pub async fn create_team(
                         .body(format!("Error assigning team admin: {}", err))
                 }
             }
-        }
+        },
         Err(err) => {
             error!("Error creating team: {}", err);
             HttpResponse::InternalServerError()
@@ -225,6 +314,8 @@ pub async fn create_team(
     }
 }
 
+/// Updated invite_user endpoint using the "find_user_email" fix logic.
+/// We now attempt to resolve the invitee_id: if it's not a valid ObjectId, we search by email then by username.
 pub async fn invite_user(
     req: HttpRequest,
     data: web::Data<AppState>,
@@ -241,7 +332,9 @@ pub async fn invite_user(
 
     let user_teams_collection = data.mongodb.db.collection::<UserTeam>("user_teams");
     let invitations_collection = data.mongodb.db.collection::<TeamInvitation>("team_invitations");
+    let users_collection = data.mongodb.db.collection::<User>("users");
 
+    // Ensure the requester is an admin of the team.
     let admin_filter = doc! {
         "team_id": &team_id,
         "user_id": &current_user,
@@ -250,9 +343,27 @@ pub async fn invite_user(
 
     match user_teams_collection.find_one(admin_filter).await {
         Ok(Some(_)) => {
+            // Resolve invitee_id: if it’s a valid ObjectId, use it;
+            // otherwise, try to find a user by email then by username.
+            let resolved_invitee_id = if ObjectId::parse_str(&invite_info.invitee_id).is_ok() {
+                invite_info.invitee_id.clone()
+            } else {
+                let email_filter = doc! { "email": &invite_info.invitee_id };
+                if let Ok(Some(user)) = users_collection.find_one(email_filter).await {
+                    user.id.to_hex()
+                } else {
+                    let username_filter = doc! { "username": &invite_info.invitee_id };
+                    if let Ok(Some(user)) = users_collection.find_one(username_filter).await {
+                        user.id.to_hex()
+                    } else {
+                        return HttpResponse::BadRequest().body("User not found by email or username");
+                    }
+                }
+            };
+
             let member_filter = doc! {
                 "team_id": &team_id,
-                "user_id": &invite_info.invitee_id,
+                "user_id": &resolved_invitee_id,
             };
             if let Ok(Some(_)) = user_teams_collection.find_one(member_filter).await {
                 return HttpResponse::BadRequest().body("User is already a member of the team");
@@ -260,7 +371,7 @@ pub async fn invite_user(
 
             let invitation_filter = doc! {
                 "team_id": &team_id,
-                "invitee_id": &invite_info.invitee_id,
+                "invitee_id": &resolved_invitee_id,
                 "status": "pending"
             };
             if let Ok(Some(_)) = invitations_collection.find_one(invitation_filter).await {
@@ -270,7 +381,7 @@ pub async fn invite_user(
             let new_invitation = TeamInvitation {
                 invitation_id: Uuid::new_v4().to_string(),
                 team_id: team_id.clone(),
-                invitee_id: invite_info.invitee_id.clone(),
+                invitee_id: resolved_invitee_id.clone(),
                 inviter_id: current_user.clone(),
                 status: "pending".to_string(),
                 sent_at: Utc::now(),
@@ -279,7 +390,7 @@ pub async fn invite_user(
 
             match invitations_collection.insert_one(new_invitation).await {
                 Ok(_) => {
-                    info!("User {} invited to team {}", invite_info.invitee_id, team_id);
+                    info!("User {} invited to team {}", resolved_invitee_id, team_id);
                     HttpResponse::Ok().body("Invitation sent successfully")
                 },
                 Err(err) => {
@@ -288,7 +399,7 @@ pub async fn invite_user(
                         .body(format!("Error inviting user: {}", err))
                 }
             }
-        }
+        },
         Ok(None) => HttpResponse::Unauthorized().body("Only team admins can invite users"),
         Err(err) => HttpResponse::InternalServerError()
             .body(format!("Error checking admin status: {}", err)),
@@ -316,9 +427,7 @@ pub async fn get_team_members(
         Ok(Some(_)) => {
             let mut combined_members: Vec<TeamMemberInfo> = Vec::new();
 
-            // ----------------------------------------
             // First: get all accepted members in user_teams
-            // ----------------------------------------
             let filter = doc! { "team_id": &*team_id };
             let mut cursor = match user_teams_collection.find(filter).await {
                 Ok(cursor) => cursor,
@@ -344,10 +453,9 @@ pub async fn get_team_members(
                                 invitation_id: None,
                             });
                         } else {
-                            // OID didn't match any user
+                            // OID didn't match any user; fallback
                             combined_members.push(TeamMemberInfo {
                                 user_id: member.user_id.clone(),
-                                // fallback: show the string itself
                                 email: member.user_id.clone(),
                                 username: None,
                                 status: "accepted".to_string(),
@@ -367,9 +475,7 @@ pub async fn get_team_members(
                 }
             }
 
-            // ----------------------------------------
             // Next: fetch all pending invitations
-            // ----------------------------------------
             let invitations_collection = data.mongodb.db.collection::<TeamInvitation>("team_invitations");
             let inv_filter = doc! {
                 "team_id": &*team_id,
@@ -385,7 +491,7 @@ pub async fn get_team_members(
 
             while let Some(inv_res) = inv_cursor.next().await {
                 if let Ok(inv) = inv_res {
-                    // 1) If invitee_id is an ObjectId, try to fetch that user
+                    // 1) If invitee_id is a valid ObjectId, try to fetch that user
                     if let Ok(inv_oid) = ObjectId::parse_str(&inv.invitee_id) {
                         let user_filter = doc! { "_id": inv_oid };
                         if let Ok(Some(user_doc)) = users_collection.find_one(user_filter).await {
@@ -407,7 +513,7 @@ pub async fn get_team_members(
                             });
                         }
                     } else {
-                        // 2) If not an ObjectId, attempt to find a user by email
+                        // 2) If not a valid ObjectId, attempt to find a user by email
                         let email_filter = doc! { "email": &inv.invitee_id };
                         if let Ok(Some(user_doc)) = users_collection.find_one(email_filter).await {
                             combined_members.push(TeamMemberInfo {
@@ -429,8 +535,7 @@ pub async fn get_team_members(
                                     invitation_id: Some(inv.invitation_id.clone()),
                                 });
                             } else {
-                                // 4) If we can't find them at all, place them with an empty user_id
-                                //    and put the raw invitee_id in username or email—your choice
+                                // 4) Fallback: store the raw invitee_id
                                 combined_members.push(TeamMemberInfo {
                                     user_id: "".to_string(),
                                     email: inv.invitee_id.clone(),
@@ -445,7 +550,7 @@ pub async fn get_team_members(
             }
 
             HttpResponse::Ok().json(combined_members)
-        }
+        },
         Ok(None) => HttpResponse::Unauthorized().body("You are not a member of this team"),
         Err(err) => HttpResponse::InternalServerError()
             .body(format!("Error checking membership: {}", err)),
@@ -514,14 +619,10 @@ pub async fn update_team(
             let membership_filter = doc! { "team_id": &team_id, "user_id": new_owner };
             match user_teams_collection.find_one(membership_filter).await {
                 Ok(Some(_)) => {
-                    update_doc
-                        .get_document_mut("$set")
-                        .unwrap()
-                        .insert("owner_id", new_owner);
+                    update_doc.get_document_mut("$set").unwrap().insert("owner_id", new_owner);
                 }
                 _ => {
-                    return HttpResponse::BadRequest()
-                        .body("New owner must be a member of the team")
+                    return HttpResponse::BadRequest().body("New owner must be a member of the team")
                 }
             }
         }
@@ -563,7 +664,7 @@ pub async fn delete_team(
             let membership_filter = doc! { "team_id": &team_id };
             let _ = user_teams_collection.delete_many(membership_filter).await;
             HttpResponse::Ok().body("Team deleted successfully")
-        }
+        },
         Err(e) => HttpResponse::InternalServerError().body(format!("Error deleting team: {}", e)),
     }
 }
@@ -589,8 +690,7 @@ pub async fn remove_team_member(
     match user_teams_collection.find_one(admin_filter).await {
         Ok(Some(_)) => {}
         Ok(None) => return HttpResponse::Unauthorized().body("Only team admins can remove members"),
-        Err(e) => return HttpResponse::InternalServerError()
-            .body(format!("Error verifying admin status: {}", e)),
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error verifying admin status: {}", e)),
     }
 
     let member_filter = doc! {
@@ -604,14 +704,9 @@ pub async fn remove_team_member(
             } else {
                 HttpResponse::NotFound().body("Member not found in team")
             }
-        }
+        },
         Err(e) => HttpResponse::InternalServerError().body(format!("Error removing member: {}", e)),
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AcceptDeclinePayload {
-    pub invitation_id: String,
 }
 
 pub async fn accept_invitation(
@@ -632,8 +727,7 @@ pub async fn accept_invitation(
     let invitation = match invitations_collection.find_one(filter.clone()).await {
         Ok(Some(inv)) => inv,
         Ok(None) => return HttpResponse::NotFound().body("Invitation not found"),
-        Err(e) => return HttpResponse::InternalServerError()
-            .body(format!("Error fetching invitation: {}", e)),
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error fetching invitation: {}", e)),
     };
 
     if invitation.invitee_id != current_user {
@@ -694,8 +788,7 @@ pub async fn decline_invitation(
     let invitation = match invitations_collection.find_one(filter.clone()).await {
         Ok(Some(inv)) => inv,
         Ok(None) => return HttpResponse::NotFound().body("Invitation not found"),
-        Err(e) => return HttpResponse::InternalServerError()
-            .body(format!("Error fetching invitation: {}", e)),
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error fetching invitation: {}", e)),
     };
 
     if invitation.invitee_id != current_user {
@@ -747,10 +840,10 @@ pub async fn delete_invitations(
                 Ok(delete_result) => {
                     let count = delete_result.deleted_count;
                     HttpResponse::Ok().body(format!("Deleted {} invitation(s)", count))
-                }
+                },
                 Err(e) => HttpResponse::InternalServerError().body(format!("Error deleting invitations: {}", e))
             }
-        }
+        },
         Ok(None) => HttpResponse::Unauthorized().body("Only team admins can delete invitations"),
         Err(e) => HttpResponse::InternalServerError().body(format!("Error verifying admin status: {}", e)),
     }
