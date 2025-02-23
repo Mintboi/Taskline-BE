@@ -12,8 +12,9 @@ mod project;
 mod chat;
 mod knowledge_base;
 mod user_management;
-// NEW (ensure this is present if you haven't already):
+// NEW:
 mod board;
+mod ticket;
 
 use std::env;
 use std::sync::Arc;
@@ -47,13 +48,17 @@ use crate::project::{
 use crate::app_state::AppState;
 use crate::chat::{
     get_user_chats, create_chat, search_chats, delete_chat, create_message,
-    get_messages
+    get_messages,
 };
 use crate::user_management::{find_user_email, get_user_by_id};
 use crate::web_socket_server::ws_index;
 // NEW: the board handlers
 use crate::board::{
     list_boards, create_board, update_board, delete_board,
+};
+// NEW: the ticket handlers (import all needed endpoints)
+use crate::ticket::{
+    create_ticket, list_tickets, get_ticket, update_ticket, delete_ticket,
 };
 
 #[derive(Debug)]
@@ -167,13 +172,9 @@ async fn main() -> std::io::Result<()> {
             .max_age(3600);
 
         App::new()
-            // Logging middleware
             .wrap(Logger::default())
-            // CORS
             .wrap(cors)
-            // Our custom authentication
             .wrap(Authentication)
-            // Global state: pass the references to the chat_server actor and DB
             .app_data(web::Data::new(AppState {
                 chat_server: chat_server.clone(),
                 mongodb: mongodb.clone(),
@@ -221,6 +222,15 @@ async fn main() -> std::io::Result<()> {
                                             .route("", web::post().to(create_board))
                                             .route("/{board_id}", web::put().to(update_board))
                                             .route("/{board_id}", web::delete().to(delete_board))
+                                    )
+                                    // NEW: Ticket routes nested under "projects"
+                                    .service(
+                                        web::scope("/{project_id}/tickets")
+                                            .route("", web::get().to(list_tickets))
+                                            .route("", web::post().to(create_ticket))
+                                            .route("/{ticket_id}", web::get().to(get_ticket))
+                                            .route("/{ticket_id}", web::put().to(update_ticket))
+                                            .route("/{ticket_id}", web::delete().to(delete_ticket))
                                     )
                             )
                     )

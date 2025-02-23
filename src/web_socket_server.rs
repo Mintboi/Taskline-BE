@@ -1,22 +1,12 @@
-// src/web_socket_server.rs
-
-use actix::{
-    Actor, ActorContext, AsyncContext, ContextFutureSpawner,
-    Handler, StreamHandler,
-};
+use actix::{Actor, Handler, StreamHandler, Message, ActorContext, AsyncContext};
 use actix_web::{Error, HttpRequest, HttpResponse, web};
 use actix_web_actors::ws;
 use log::{info, error};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use crate::chat_server::{ChatServer, Connect, Disconnect, CreateMessage, ChatMessage, WsMessage, RelaySignal};
 
-use crate::app_state::AppState;
-use crate::chat_server::{
-    ChatServer, Connect, Disconnect, CreateMessage, ChatMessage,
-};
-
-/// This actor represents a single WebSocket connection (a browser tab).
-/// - `user_id`: which user is connected
-/// - `chat_server`: reference to the shared ChatServer actor
+/// This actor represents a single WebSocket connection.
 pub struct WsSession {
     pub user_id: String,
     pub chat_server: actix::Addr<ChatServer>,
@@ -27,57 +17,68 @@ impl Actor for WsSession {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         info!("WebSocket started for user_id: {}", self.user_id);
-
-        // Register with ChatServer so we can receive ChatMessage pushes
         self.chat_server.do_send(Connect {
             user_id: self.user_id.clone(),
-            chat_id: String::new(), // Not tying user to a single chat yet
+            chat_id: String::new(),
             addr: ctx.address().recipient(),
         });
     }
 
     fn stopped(&mut self, _: &mut Self::Context) {
         info!("WebSocket stopped for user_id: {}", self.user_id);
-
-        // Tell ChatServer we have disconnected
         self.chat_server.do_send(Disconnect {
             user_id: self.user_id.clone(),
         });
     }
 }
 
-/// The server can push new messages to us via a `ChatMessage`.
-impl Handler<ChatMessage> for WsSession {
+impl Handler<WsMessage> for WsSession {
     type Result = ();
 
-    fn handle(&mut self, msg: ChatMessage, ctx: &mut ws::WebsocketContext<Self>) {
-        // We turn it into JSON, so the browser can parse it.
-        let json = serde_json::json!({
-            "chat_id": msg.chat_id,
-            "sender_id": msg.sender_id,
-            "content": msg.content
-        });
-        ctx.text(json.to_string());
+    fn handle(&mut self, msg: WsMessage, ctx: &mut ws::WebsocketContext<Self>) {
+        match msg {
+            WsMessage::Chat(chat_msg) => {
+                let json = serde_json::json!({
+                    "chat_id": chat_msg.chat_id,
+                    "sender_id": chat_msg.sender_id,
+                    "content": chat_msg.content
+                });
+                ctx.text(json.to_string());
+            }
+            WsMessage::Signal(signal_msg) => {
+                ctx.text(signal_msg.payload);
+            }
+        }
     }
 }
 
-/// A struct for messages the browser might send us over WebSocket:
 #[derive(Deserialize, Serialize)]
 struct ClientMsg {
     pub chat_id: String,
     pub content: String,
 }
 
-/// Implementation so we can receive messages from the browser
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsSession {
     fn handle(&mut self, item: Result<ws::Message, ws::ProtocolError>, ctx: &mut ws::WebsocketContext<Self>) {
         match item {
             Ok(ws::Message::Text(txt)) => {
                 info!("Received from user {}: {}", self.user_id, txt);
-
-                // Suppose the browser sends JSON like: { "chat_id": "...", "content": "Hello" }
+                if let Ok(json_val) = serde_json::from_str::<Value>(&txt) {
+                    if json_val.get("signalType").is_some() {
+                        let chat_id = json_val.get("chat_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        info!("Relaying signal from user {} for chat {}", self.user_id, chat_id);
+                        self.chat_server.do_send(RelaySignal {
+                            user_id: self.user_id.clone(),
+                            chat_id,
+                            message: txt.to_string(),
+                        });
+                        return;
+                    }
+                }
                 if let Ok(msg) = serde_json::from_str::<ClientMsg>(&txt) {
-                    // We forward to ChatServer to create a message:
                     self.chat_server.do_send(CreateMessage {
                         user_id: self.user_id.clone(),
                         chat_id: msg.chat_id,
@@ -95,14 +96,11 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsSession {
     }
 }
 
-/// The HTTP handler that upgrades to a WebSocket.
-/// e.g. `.route("/ws", web::get().to(ws_index))` in `main.rs`.
 pub async fn ws_index(
     req: HttpRequest,
     stream: web::Payload,
-    data: web::Data<AppState>,
+    data: web::Data<crate::app_state::AppState>,
 ) -> Result<HttpResponse, Error> {
-    // We parse `?userId=abc` from the URL query string
     let query = req.uri().query().unwrap_or("");
     let mut user_id = "Anonymous".to_string();
     for piece in query.split('&') {
@@ -110,12 +108,9 @@ pub async fn ws_index(
             user_id = val.to_string();
         }
     }
-
     let ws_session = WsSession {
         user_id,
         chat_server: data.chat_server.clone(),
     };
-
-    // This actix call upgrades the HTTP connection to a WebSocket
     ws::start(ws_session, &req, stream)
 }

@@ -1,5 +1,3 @@
-// src/chat_server.rs
-
 use crate::chat_db::MongoDB;
 use actix::prelude::*;
 use chrono::{DateTime, Utc};
@@ -12,7 +10,6 @@ use log::{error, info};
 
 use crate::app_state::AppState;
 
-/// A push message from `ChatServer` to each user’s `WsSession` (server -> client).
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct ChatMessage {
@@ -21,24 +18,33 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// A message to register a WebSocket connection with the `ChatServer`.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct SignalMessage {
+    pub payload: String,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub enum WsMessage {
+    Chat(ChatMessage),
+    Signal(SignalMessage),
+}
+
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Connect {
     pub user_id: String,
-    pub chat_id: String,  // if you want them to join a specific chat, otherwise can be empty
-    pub addr: Recipient<ChatMessage>,
+    pub chat_id: String,
+    pub addr: Recipient<WsMessage>,
 }
 
-/// A message to tell `ChatServer` a user’s WebSocket is gone.
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Disconnect {
     pub user_id: String,
 }
 
-/// A request to create a new chat message. Called by your `/messages/{chat_id}` REST route
-/// or possibly from a WebSocket client (the latter would require your WsSession to do_send(CreateMessage)).
 #[derive(Message)]
 #[rtype(result = "Result<MessageResponse, ()>")]
 pub struct CreateMessage {
@@ -48,19 +54,17 @@ pub struct CreateMessage {
     pub attachments: Option<String>,
 }
 
-/// A response containing the newly created message data.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MessageResponse {
-    pub id: String,           // The message’s string ID
-    pub id_chat: String,      // Which chat it belongs to
-    pub sender_id: String,    // Who sent it
+    pub id: String,
+    pub id_chat: String,
+    pub sender_id: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
     pub msg_type: String,
     pub attachments: Option<String>,
 }
 
-/// For completeness: A “Chat” doc in Mongo, storing `_id` and participants as strings.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Chat {
     #[serde(rename = "_id")]
@@ -72,11 +76,16 @@ pub struct Chat {
     pub last_message_at: DateTime<Utc>,
 }
 
-/// The ChatServer actor holds a `sessions` map of user_id -> WsSession address.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct RelaySignal {
+    pub user_id: String,
+    pub chat_id: String,
+    pub message: String,
+}
+
 pub struct ChatServer {
-    /// For real-time, store each user’s WebSocket address if connected.
-    sessions: HashMap<String, Recipient<ChatMessage>>,
-    /// A handle to your MongoDB so you can read/write chat & message docs.
+    sessions: HashMap<String, Recipient<WsMessage>>,
     db: Arc<MongoDB>,
 }
 
@@ -88,7 +97,6 @@ impl ChatServer {
         }
     }
 
-    /// Helper to load a “Chat” doc by `_id`.
     async fn get_chat_by_id(&self, chat_id_str: &str) -> Option<Chat> {
         let collection = self.db.db.collection::<Chat>("chats");
         match collection.find_one(doc! { "_id": chat_id_str }).await {
@@ -102,64 +110,41 @@ impl Actor for ChatServer {
     type Context = Context<Self>;
 }
 
-// ---------------------------------------------------------------------
-// Handler for Connect
-// ---------------------------------------------------------------------
 impl Handler<Connect> for ChatServer {
     type Result = ();
 
     fn handle(&mut self, msg: Connect, _: &mut Context<Self>) {
-        info!("User {} connected (WebSocket). ChatID param: {}", msg.user_id, msg.chat_id);
-
-        // Insert the user’s WsSession address into our sessions map
+        info!("User {} connected (WS). ChatID param: {}", msg.user_id, msg.chat_id);
         self.sessions.insert(msg.user_id.clone(), msg.addr);
     }
 }
 
-// ---------------------------------------------------------------------
-// Handler for Disconnect
-// ---------------------------------------------------------------------
 impl Handler<Disconnect> for ChatServer {
     type Result = ();
 
     fn handle(&mut self, msg: Disconnect, _: &mut Context<Self>) {
-        info!("User {} disconnected (WebSocket)", msg.user_id);
+        info!("User {} disconnected (WS)", msg.user_id);
         self.sessions.remove(&msg.user_id);
     }
 }
 
-// ---------------------------------------------------------------------
-// Handler for CreateMessage (the main piece for new chat messages)
-// ---------------------------------------------------------------------
 impl Handler<CreateMessage> for ChatServer {
     type Result = ResponseFuture<Result<MessageResponse, ()>>;
 
     fn handle(&mut self, msg: CreateMessage, _: &mut Context<Self>) -> Self::Result {
         let db = self.db.clone();
-        let sessions_map = self.sessions.clone(); // so we can broadcast afterwards
-
+        let sessions_map = self.sessions.clone();
         Box::pin(async move {
-            // 1) Load chat from DB
             let chats_coll = db.db.collection::<Chat>("chats");
-            let chat_doc = match chats_coll
-                .find_one(doc! { "_id": &msg.chat_id })
-                .await
-            {
+            let chat_doc = match chats_coll.find_one(doc! { "_id": &msg.chat_id }).await {
                 Ok(Some(c)) => c,
                 _ => return Err(()),
             };
-
-            // 2) Check membership
             if !chat_doc.participants.contains(&msg.user_id) {
-                // user not in chat => fail
                 return Err(());
             }
-
-            // 3) Insert new message into "messages" collection
             let now = Utc::now();
             let new_msg_id = uuid::Uuid::new_v4().to_string();
-
-            // If your messages are stored as raw doc, or with a struct:
             #[derive(Serialize)]
             struct DBMessage {
                 #[serde(rename = "_id")]
@@ -172,7 +157,6 @@ impl Handler<CreateMessage> for ChatServer {
                 pub msg_type: String,
                 pub attachments: Option<String>,
             }
-
             let new_db_msg = DBMessage {
                 id: new_msg_id.clone(),
                 id_chat: msg.chat_id.clone(),
@@ -182,25 +166,21 @@ impl Handler<CreateMessage> for ChatServer {
                 msg_type: "text".to_string(),
                 attachments: msg.attachments.clone(),
             };
-
             let messages_coll = db.db.collection::<DBMessage>("messages");
-            if messages_coll.insert_one(&new_db_msg).await.is_err() {
+            if messages_coll.insert_one(new_db_msg).await.is_err() {
                 return Err(());
             }
-
-            // 4) Broadcast via WebSocket to all participants who are connected
             for participant_id in &chat_doc.participants {
-                if let Some(ws_addr) = sessions_map.get(participant_id) {
-                    // Send them a ChatMessage
-                    ws_addr.do_send(ChatMessage {
-                        chat_id: msg.chat_id.clone(),
-                        sender_id: msg.user_id.clone(),
-                        content: msg.content.clone(),
-                    });
+                if participant_id != &msg.user_id {
+                    if let Some(ws_addr) = sessions_map.get(participant_id) {
+                        ws_addr.do_send(WsMessage::Chat(ChatMessage {
+                            chat_id: msg.chat_id.clone(),
+                            sender_id: msg.user_id.clone(),
+                            content: msg.content.clone(),
+                        }));
+                    }
                 }
             }
-
-            // 5) Return a “MessageResponse” to the REST caller
             Ok(MessageResponse {
                 id: new_msg_id,
                 id_chat: msg.chat_id,
@@ -212,4 +192,147 @@ impl Handler<CreateMessage> for ChatServer {
             })
         })
     }
+}
+
+impl Handler<RelaySignal> for ChatServer {
+    type Result = ResponseFuture<()>;
+
+    fn handle(&mut self, msg: RelaySignal, _ctx: &mut Context<Self>) -> Self::Result {
+        let sessions_map = self.sessions.clone();
+        let db = self.db.clone();
+        Box::pin(async move {
+            let chats_coll = db.db.collection::<Chat>("chats");
+            if let Ok(Some(chat_doc)) = chats_coll.find_one(doc! { "_id": &msg.chat_id }).await {
+                for participant in chat_doc.participants {
+                    if participant != msg.user_id {
+                        if let Some(addr) = sessions_map.get(&participant) {
+                            addr.do_send(WsMessage::Signal(SignalMessage {
+                                payload: msg.message.clone(),
+                            }));
+                        }
+                    }
+                }
+            } else {
+                for (uid, addr) in sessions_map.iter() {
+                    if uid != &msg.user_id {
+                        addr.do_send(WsMessage::Signal(SignalMessage {
+                            payload: msg.message.clone(),
+                        }));
+                    }
+                }
+            }
+        })
+    }
+}
+
+use actix_web::{Error, HttpRequest, HttpResponse, web};
+use actix_web_actors::ws;
+use serde_json::Value;
+
+pub struct WsSession {
+    pub user_id: String,
+    pub chat_server: actix::Addr<ChatServer>,
+}
+
+impl Actor for WsSession {
+    type Context = ws::WebsocketContext<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        info!("WebSocket started for user_id: {}", self.user_id);
+        self.chat_server.do_send(Connect {
+            user_id: self.user_id.clone(),
+            chat_id: String::new(),
+            addr: ctx.address().recipient(),
+        });
+    }
+
+    fn stopped(&mut self, _: &mut Self::Context) {
+        info!("WebSocket stopped for user_id: {}", self.user_id);
+        self.chat_server.do_send(Disconnect {
+            user_id: self.user_id.clone(),
+        });
+    }
+}
+
+impl Handler<WsMessage> for WsSession {
+    type Result = ();
+
+    fn handle(&mut self, msg: WsMessage, ctx: &mut ws::WebsocketContext<Self>) {
+        match msg {
+            WsMessage::Chat(chat_msg) => {
+                let json = serde_json::json!({
+                    "chat_id": chat_msg.chat_id,
+                    "sender_id": chat_msg.sender_id,
+                    "content": chat_msg.content
+                });
+                ctx.text(json.to_string());
+            }
+            WsMessage::Signal(signal_msg) => {
+                ctx.text(signal_msg.payload);
+            }
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct ClientMsg {
+    pub chat_id: String,
+    pub content: String,
+}
+
+impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsSession {
+    fn handle(&mut self, item: Result<ws::Message, ws::ProtocolError>, ctx: &mut ws::WebsocketContext<Self>) {
+        match item {
+            Ok(ws::Message::Text(txt)) => {
+                info!("Received from user {}: {}", self.user_id, txt);
+                if let Ok(json_val) = serde_json::from_str::<Value>(&txt) {
+                    if json_val.get("signalType").is_some() {
+                        let chat_id = json_val.get("chat_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        info!("Relaying signal from user {} for chat {}", self.user_id, chat_id);
+                        self.chat_server.do_send(RelaySignal {
+                            user_id: self.user_id.clone(),
+                            chat_id,
+                            message: txt.to_string(),
+                        });
+                        return;
+                    }
+                }
+                if let Ok(msg) = serde_json::from_str::<ClientMsg>(&txt) {
+                    self.chat_server.do_send(CreateMessage {
+                        user_id: self.user_id.clone(),
+                        chat_id: msg.chat_id,
+                        content: msg.content,
+                        attachments: None,
+                    });
+                }
+            }
+            Ok(ws::Message::Close(_)) => {
+                info!("WsSession: user {} closed", self.user_id);
+                ctx.stop();
+            }
+            _ => {}
+        }
+    }
+}
+
+pub async fn ws_index(
+    req: HttpRequest,
+    stream: web::Payload,
+    data: web::Data<AppState>,
+) -> Result<HttpResponse, Error> {
+    let query = req.uri().query().unwrap_or("");
+    let mut user_id = "Anonymous".to_string();
+    for piece in query.split('&') {
+        if let Some(val) = piece.strip_prefix("userId=") {
+            user_id = val.to_string();
+        }
+    }
+    let ws_session = WsSession {
+        user_id,
+        chat_server: data.chat_server.clone(),
+    };
+    ws::start(ws_session, &req, stream)
 }
