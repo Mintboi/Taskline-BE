@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::chat_server::{ChatServer, Connect, Disconnect, CreateMessage, ChatMessage, WsMessage, RelaySignal};
 
-/// This actor represents a single WebSocket connection.
 pub struct WsSession {
     pub user_id: String,
     pub chat_server: actix::Addr<ChatServer>,
@@ -24,14 +23,14 @@ impl Actor for WsSession {
         });
     }
 
-    fn stopped(&mut self, _: &mut Self::Context) {
+    fn stopped(&mut self, ctx: &mut Self::Context) {
         info!("WebSocket stopped for user_id: {}", self.user_id);
         self.chat_server.do_send(Disconnect {
             user_id: self.user_id.clone(),
+            addr: ctx.address().recipient(),
         });
     }
 }
-
 impl Handler<WsMessage> for WsSession {
     type Result = ();
 

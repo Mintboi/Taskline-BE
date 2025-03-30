@@ -48,7 +48,7 @@ use crate::project::{
 use crate::app_state::AppState;
 use crate::chat::{
     get_user_chats, create_chat, search_chats, delete_chat, create_message,
-    get_messages,
+    get_messages, get_single_chat,
 };
 use crate::user_management::{find_user_email, get_user_by_id};
 use crate::web_socket_server::ws_index;
@@ -180,6 +180,7 @@ async fn main() -> std::io::Result<()> {
                 mongodb: mongodb.clone(),
                 config: config.clone(),
             }))
+            // AUTH
             .service(
                 web::scope("/auth")
                     .route("/signup", web::post().to(signup))
@@ -242,8 +243,9 @@ async fn main() -> std::io::Result<()> {
                     .route("", web::post().to(create_chat))
                     .route("/search/{user_id}", web::get().to(search_chats))
                     .route("/{chat_id}", web::delete().to(delete_chat))
+                    .route("/get/{chat_id}", web::get().to(get_single_chat))
             )
-            // MESSAGES (GET and POST)
+            // MESSAGES
             .service(
                 web::scope("/messages")
                     .route("/{chat_id}", web::get().to(get_messages))
@@ -256,9 +258,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/get/{id}", web::get().to(get_user_by_id))
             )
             // WEBSOCKET route for real-time
-            .service(
-                web::resource("/ws").route(web::get().to(ws_index))
-            )
+            .service(web::resource("/ws").route(web::get().to(ws_index)))
     })
         .bind("0.0.0.0:8080")?
         .run()
