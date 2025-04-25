@@ -12,9 +12,11 @@ mod project;
 mod chat;
 mod knowledge_base;
 mod user_management;
-// NEW:
 mod board;
 mod ticket;
+mod calendar;
+mod ai_endpoints;
+mod dashboard_data;
 
 use std::env;
 use std::sync::Arc;
@@ -24,18 +26,13 @@ use std::pin::Pin;
 
 use actix::Actor;
 use actix_cors::Cors;
-use actix_web::{
-    body::{BoxBody, MessageBody},
-    dev::{Service, ServiceRequest, ServiceResponse, Transform},
-    http,
-    middleware::Logger,
-    web, App, Error, HttpMessage, HttpResponse, HttpServer, HttpRequest,
-};
+use actix_web::{body::{BoxBody, MessageBody}, dev::{Service, ServiceRequest, ServiceResponse, Transform}, http, middleware::Logger, web, App, Error, HttpMessage, HttpResponse, HttpServer};
 use env_logger::Env;
 use futures::future::{ok, Ready};
 use jsonwebtoken::{decode, DecodingKey, Validation};
-use mongodb::bson::doc;
 
+use crate::user_management::{get_working_hours, set_working_hours};
+use crate::calendar::{create_event, get_user_events};
 use crate::auth::{login, signup, Claims};
 use crate::team_management::{
     create_team, get_team_members, get_user_teams, invite_user,
@@ -43,23 +40,25 @@ use crate::team_management::{
     accept_invitation, decline_invitation, delete_invitations, get_pending_invitations,
 };
 use crate::project::{
-    create_project, list_projects, get_project, update_project, delete_project,
+    create_project, list_projects, get_project, update_project, delete_project,add_user_to_project
 };
 use crate::app_state::AppState;
 use crate::chat::{
-    get_user_chats, create_chat, search_chats, delete_chat, create_message,
-    get_messages, get_single_chat,
+    get_user_chats, create_chat, search_chats, delete_chat,
+    get_single_chat, update_chat, create_message, get_messages,
 };
 use crate::user_management::{find_user_email, get_user_by_id};
 use crate::web_socket_server::ws_index;
-// NEW: the board handlers
 use crate::board::{
-    list_boards, create_board, update_board, delete_board,
+    list_boards, create_board, update_board, delete_board, add_user_to_board,
 };
-// NEW: the ticket handlers (import all needed endpoints)
 use crate::ticket::{
     create_ticket, list_tickets, get_ticket, update_ticket, delete_ticket,
 };
+use crate::knowledge_base::{
+    create_document, delete_document, get_team_documents, update_document,
+};
+use crate::dashboard_data::{get_dashboard_data, upsert_dashboard_data};
 
 #[derive(Debug)]
 pub struct Authentication;
@@ -100,14 +99,12 @@ where
     }
 
     fn call(&self, mut req: ServiceRequest) -> Self::Future {
-        // Extract "Bearer <token>" from the Authorization header if present
         if let Some(auth_header) = req.headers().get(http::header::AUTHORIZATION) {
             if let Ok(auth_str) = auth_header.to_str() {
                 if auth_str.starts_with("Bearer ") {
                     let token = auth_str.trim_start_matches("Bearer ").trim().to_string();
                     match verify_token(&token) {
                         Ok(user_id) => {
-                            // Insert user_id as a string extension
                             req.extensions_mut().insert(user_id);
                         }
                         Err(e) => {
@@ -150,7 +147,6 @@ async fn main() -> std::io::Result<()> {
 
     let config = config::Config::from_env();
     let mongodb = Arc::new(chat_db::MongoDB::init(&config.mongo_uri, &config.database_name).await);
-    // Start the ChatServer actor, which uses string-based IDs
     let chat_server = chat_server::ChatServer::new(mongodb.clone()).start();
 
     let frontend_origin = env::var("FRONTEND_ORIGIN")
@@ -162,7 +158,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin(&frontend_origin)
-            .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+            .allowed_methods(vec!["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
             .allowed_headers(vec![
                 http::header::CONTENT_TYPE,
                 http::header::ACCEPT,
@@ -179,14 +175,15 @@ async fn main() -> std::io::Result<()> {
                 chat_server: chat_server.clone(),
                 mongodb: mongodb.clone(),
                 config: config.clone(),
+                http_client: Default::default(),
             }))
-            // AUTH
+            // auth
             .service(
                 web::scope("/auth")
                     .route("/signup", web::post().to(signup))
                     .route("/login", web::post().to(login))
             )
-            // TEAMS
+            // teams & related
             .service(
                 web::scope("/teams")
                     .route("/user_teams/{user_id}", web::get().to(get_user_teams))
@@ -216,15 +213,15 @@ async fn main() -> std::io::Result<()> {
                                     .route("/{project_id}", web::get().to(get_project))
                                     .route("/{project_id}", web::put().to(update_project))
                                     .route("/{project_id}", web::delete().to(delete_project))
-                                    // NEW: Board routes nested under "projects"
+                                    .route("/{project_id}/members", web::post().to(add_user_to_project))
                                     .service(
                                         web::scope("/{project_id}/boards")
                                             .route("", web::get().to(list_boards))
                                             .route("", web::post().to(create_board))
                                             .route("/{board_id}", web::put().to(update_board))
                                             .route("/{board_id}", web::delete().to(delete_board))
+                                            .route("/{board_id}/members", web::post().to(add_user_to_board))
                                     )
-                                    // NEW: Ticket routes nested under "projects"
                                     .service(
                                         web::scope("/{project_id}/tickets")
                                             .route("", web::get().to(list_tickets))
@@ -236,31 +233,57 @@ async fn main() -> std::io::Result<()> {
                             )
                     )
             )
-            // CHATS
+            //TEAM-DATA
+            .service(
+                web::scope("/team-data")
+                    .route("/{team_id}", web::get().to(get_dashboard_data))
+                    .route("/{team_id}", web::put().to(upsert_dashboard_data))
+            )
+            // chats & messages
             .service(
                 web::scope("/chats")
                     .route("/{user_id}", web::get().to(get_user_chats))
                     .route("", web::post().to(create_chat))
                     .route("/search/{user_id}", web::get().to(search_chats))
+                    .route("/{chat_id}", web::patch().to(update_chat))
                     .route("/{chat_id}", web::delete().to(delete_chat))
                     .route("/get/{chat_id}", web::get().to(get_single_chat))
             )
-            // MESSAGES
             .service(
                 web::scope("/messages")
                     .route("/{chat_id}", web::get().to(get_messages))
                     .route("/{chat_id}", web::post().to(create_message))
             )
-            // USERS
+
+            // users
             .service(
                 web::scope("/users")
                     .route("/find_user_email", web::get().to(find_user_email))
                     .route("/get/{id}", web::get().to(get_user_by_id))
+                    .route("/working-hours", web::get().to(get_working_hours))
+                    .route("/working-hours", web::post().to(set_working_hours))
             )
-            // WEBSOCKET route for real-time
+
+            // websocket
             .service(web::resource("/ws").route(web::get().to(ws_index)))
+
+            // calendar
+            .service(
+                web::scope("/calendar")
+                    .route("/events", web::post().to(create_event))
+                    .route("/events/{user_id}", web::get().to(get_user_events))
+            )
+
+            // knowledge base
+            .service(
+                web::scope("/knowledge_base")
+                    .route("", web::post().to(create_document))
+                    .route("/{team_id}", web::get().to(get_team_documents))
+                    .route("/{doc_id}", web::put().to(update_document))
+                    .route("/{doc_id}", web::delete().to(delete_document))
+            )
     })
-        .bind("0.0.0.0:8080")?
+        .bind(("0.0.0.0", 8080))?
         .run()
         .await
 }

@@ -1,6 +1,8 @@
+use bson::serde_helpers::chrono_datetime_as_bson_datetime;
 use actix_web::{web, HttpResponse, Responder, HttpRequest, HttpMessage};
+use bson::DateTime;
 use futures_util::StreamExt;
-use mongodb::bson::doc;
+use mongodb::bson::{self, doc, DateTime as BsonDateTime};
 use serde::{Deserialize, Serialize};
 use chrono::Utc;
 
@@ -14,8 +16,8 @@ pub struct Chat {
     pub participants: Vec<String>,
     pub is_group: bool,
     pub group_name: Option<String>,
-    pub created_at: chrono::DateTime<Utc>,
-    pub last_message_at: chrono::DateTime<Utc>,
+    pub created_at: BsonDateTime,
+    pub last_message_at: BsonDateTime,
 }
 
 #[derive(Deserialize)]
@@ -30,6 +32,12 @@ pub struct CreateChatRequest {
 pub struct CreateMessagePayload {
     pub sender_id: String,
     pub content: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateChatRequest {
+    pub participants: Vec<String>,
+    pub group_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -171,8 +179,8 @@ pub async fn create_chat(
         participants: chat_info.participants.clone(),
         is_group,
         group_name: if is_group { Some(group_name) } else { None },
-        created_at: now,
-        last_message_at: now,
+        created_at: DateTime::from(now),
+        last_message_at: DateTime::from(now),
     };
 
     let chats_collection = data.mongodb.db.collection::<Chat>("chats");
@@ -263,7 +271,65 @@ pub async fn delete_chat(
         Err(e) => HttpResponse::InternalServerError().body(format!("Error deleting chat: {}", e)),
     }
 }
+pub async fn update_chat(
+    data: web::Data<AppState>,
+    chat_id_path: web::Path<String>,
+    req: HttpRequest,
+    upd: web::Json<UpdateChatRequest>,
+) -> impl Responder {
+    // 1) Auth
+    let user_id = match req.extensions().get::<String>().cloned() {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().body("Unauthorized"),
+    };
+    let chat_id = chat_id_path.into_inner();
 
+    // 2) Ensure the user is a participant
+    let coll = data.mongodb.db.collection::<Chat>("chats");
+    match coll
+        .find_one(doc! { "_id": &chat_id, "participants": &user_id })
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None)    => return HttpResponse::Forbidden().body("Not a participant"),
+        Err(e)      => return HttpResponse::InternalServerError().body(format!("DB error: {}", e)),
+    }
+
+    // 3) Build an update with a _BSON_ DateTime
+    let now: BsonDateTime = BsonDateTime::from_chrono(Utc::now());
+    let mut update_doc = doc! {
+        "$set": {
+            "participants": &upd.participants,
+            "last_message_at": now,
+        }
+    };
+    if let Some(name) = &upd.group_name {
+        update_doc
+            .get_document_mut("$set")
+            .unwrap()
+            .insert("group_name", name.clone());
+    } else {
+        update_doc.insert("$unset", doc! { "group_name": "" });
+    }
+
+    // 4) Perform the update
+    if let Err(e) = coll
+        .update_one(doc! { "_id": &chat_id }, update_doc)
+        .await
+    {
+        return HttpResponse::InternalServerError().body(format!("Failed update: {}", e));
+    }
+
+    // 5) Return the fresh doc
+    match coll
+        .find_one(doc! { "_id": &chat_id })
+        .await
+    {
+        Ok(Some(chat)) => HttpResponse::Ok().json(chat),
+        Ok(None)       => HttpResponse::NotFound().body("Chat not found after update"),
+        Err(e)         => HttpResponse::InternalServerError().body(format!("DB error: {}", e)),
+    }
+}
 // ----------------------------------------------------------------------
 // POST /messages/{chat_id} => create a new message
 // ----------------------------------------------------------------------

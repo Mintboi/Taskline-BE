@@ -45,6 +45,8 @@ pub struct User {
     pub id: ObjectId,
     pub username: Option<String>,
     pub email: String,
+    pub working_hours_start: Option<String>,
+    pub working_hours_end: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -273,5 +275,77 @@ pub async fn get_user_by_id(
         }
     } else {
         HttpResponse::BadRequest().body("Invalid user id")
+    }
+}
+#[derive(Debug, Deserialize)]
+pub struct WorkingHoursRequest {
+    pub start: String,
+    pub end: String,
+}
+
+pub async fn set_working_hours(
+    req: HttpRequest,
+    data: web::Data<AppState>,
+    hours: web::Json<WorkingHoursRequest>,
+) -> impl Responder {
+    // Corrected: Bind extensions to a variable to extend the lifetime
+    let extensions = req.extensions();
+    let user_id = match extensions.get::<String>() {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().body("Unauthorized"),
+    };
+
+    let users_collection = data.mongodb.db.collection::<User>("users");
+    let object_id = match ObjectId::parse_str(user_id) {
+        Ok(id) => id,
+        Err(_) => return HttpResponse::BadRequest().body("Invalid user ID"),
+    };
+
+    let update = doc! {
+        "$set": {
+            "working_hours_start": &hours.start,
+            "working_hours_end": &hours.end
+        }
+    };
+
+    match users_collection.update_one(doc! { "_id": object_id }, update).await {
+        Ok(result) if result.modified_count == 1 => HttpResponse::Ok().json("Working hours updated"),
+        Ok(_) => HttpResponse::NotFound().body("User not found"),
+        Err(err) => {
+            error!("Error updating working hours: {}", err);
+            HttpResponse::InternalServerError().body("Error updating working hours")
+        }
+    }
+}
+
+pub async fn get_working_hours(
+    req: HttpRequest,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    // Corrected: Bind extensions to a variable to extend the lifetime
+    let extensions = req.extensions();
+    let user_id = match extensions.get::<String>() {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().body("Unauthorized"),
+    };
+
+    let users_collection = data.mongodb.db.collection::<User>("users");
+    let object_id = match ObjectId::parse_str(user_id) {
+        Ok(id) => id,
+        Err(_) => return HttpResponse::BadRequest().body("Invalid user ID"),
+    };
+
+    match users_collection.find_one(doc! { "_id": object_id }).await {
+        Ok(Some(user)) => HttpResponse::Ok().json({
+            let mut response = serde_json::Map::new();
+            response.insert("start".to_string(), user.working_hours_start.unwrap_or_default().into());
+            response.insert("end".to_string(), user.working_hours_end.unwrap_or_default().into());
+            response
+        }),
+        Ok(None) => HttpResponse::NotFound().body("User not found"),
+        Err(err) => {
+            error!("Error fetching working hours: {}", err);
+            HttpResponse::InternalServerError().body("Error fetching working hours")
+        }
     }
 }

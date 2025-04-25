@@ -6,4 +6,6 @@ pub struct User {
     pub username: String,
     pub email: String,
     pub password: String,
+    pub working_hours_start:String,
+    pub working_hours_end:String,
 }
